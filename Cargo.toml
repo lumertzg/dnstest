@@ -1,0 +1,21 @@
+[package]
+name = "dnstest"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+data-encoding = "2.11.1"
+futures-util = "0.3.34"
+hickory-resolver = { version = "0.26.3", features = ["dnssec-ring"] }
+mlua = { version = "0.12.2", features = ["lua54", "vendored", "async"] }
+tokio = { version = "1.54.1", features = ["macros", "rt"] }
+usage-rs = "7.1.2"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+cognitive_complexity = "warn"
+too_many_lines = "warn"
+undocumented_unsafe_blocks = "warn"
