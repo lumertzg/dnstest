@@ -12,11 +12,13 @@ async fn main() -> ExitCode {
             print!("{}", include_str!("../.agents/skills/testing-dns/SKILL.md"));
             ExitCode::SUCCESS
         }
-        Ok(cli::Command::Run { files, jobs }) => match runner::run(&files, jobs.get()).await {
-            Ok(true) => ExitCode::SUCCESS,
-            Ok(false) => ExitCode::FAILURE,
-            Err(error) => fail(error),
-        },
+        Ok(cli::Command::Run { files, jobs }) => {
+            if runner::run(&files, jobs.get()).await {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
         Err(error) => fail(error),
     }
 }

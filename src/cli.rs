@@ -37,10 +37,13 @@ pub fn command() -> Result<Command> {
 
     let mut files = Vec::new();
     for path in args.paths {
-        if path.is_file() && path.extension() != Some(OsStr::new("lua")) {
+        let metadata = std::fs::metadata(&path).map_err(|error| context(&path, error))?;
+        if metadata.is_file() && path.extension() != Some(OsStr::new("lua")) {
             return Err(format!("expected a Lua file: {}", path.display()).into());
         }
-        collect(&path, &mut files)?;
+
+        // Explicit paths follow symlinks. Only entries found while walking directories skip them.
+        collect(&path, &metadata, &mut files)?;
     }
 
     files.sort();
@@ -55,19 +58,23 @@ pub fn command() -> Result<Command> {
     })
 }
 
-fn collect(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.is_symlink() {
-        return Ok(());
-    }
-
+fn collect(path: &Path, metadata: &std::fs::Metadata, files: &mut Vec<PathBuf>) -> Result<()> {
     if metadata.is_dir() {
-        for entry in std::fs::read_dir(path)? {
-            collect(&entry?.path(), files)?;
+        for entry in std::fs::read_dir(path).map_err(|error| context(path, error))? {
+            let path = entry.map_err(|error| context(path, error))?.path();
+            let metadata =
+                std::fs::symlink_metadata(&path).map_err(|error| context(&path, error))?;
+            if !metadata.is_symlink() {
+                collect(&path, &metadata, files)?;
+            }
         }
     } else if path.extension() == Some(OsStr::new("lua")) {
-        files.push(path.canonicalize()?);
+        files.push(path.canonicalize().map_err(|error| context(path, error))?);
     }
 
     Ok(())
+}
+
+fn context(path: &Path, error: std::io::Error) -> String {
+    format!("{}: {error}", path.display())
 }
