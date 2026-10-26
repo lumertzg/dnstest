@@ -34,10 +34,13 @@ dnstest --help
 ```
 
 Exit status is 0 for success, 1 for test/load/discovery failures, and 2 for
-argument syntax errors. Files are sorted and deduplicated. Symlinks are skipped.
+argument syntax errors. Files are sorted and deduplicated. Symlinks found while
+searching directories are skipped. Symlinks passed as paths are followed.
 Files run concurrently, up to `--jobs 4` by default. Tests within a file run
-serially with a fresh Lua environment per file. `print` logs are grouped with
-their file's results. Set `NO_COLOR=1` to disable terminal colors.
+serially with a fresh Lua environment per file. `print` and `io.write` output,
+including chained `io.write(...):write(...)` calls, is grouped with its file's
+results. Writes through `io.stdout` or `io.output()` go straight to the terminal. `os.exit` raises an error instead of exiting.
+Set `NO_COLOR=1` to disable terminal colors.
 
 ## Writing tests
 
@@ -75,8 +78,10 @@ Types are case insensitive in queries. Constants such as `dns.type.A`,
 are strings. Other Hickory-supported types can also be supplied as strings.
 `dns.rcode` includes NOERROR, NXDOMAIN, SERVFAIL, FORMERR, NOTIMP, and REFUSED.
 
-Queries use system DNS, ignore hosts-file entries and search suffixes, and use
-no shared resolver cache between calls. There is no custom-nameserver option.
+Queries use the nameservers in `/etc/resolv.conf`, ignore hosts-file entries and
+search suffixes, and use no shared resolver cache between calls. Link-local IPv6
+nameservers with an interface zone, such as `fe80::1%en0`, are skipped. There is
+no custom-nameserver option.
 The only query option is `{ validate = true }` for local DNSSEC validation,
 disabled by default. The same options table is accepted by resolve and reverse.
 
@@ -102,7 +107,8 @@ and a local DNSSEC `proof`. Typed fields avoid parsing presentation text:
 | DNSKEY | `flags`, `key_tag`, `algorithm`, `public_key` (base64) |
 | RRSIG | `type_covered`, `algorithm`, `labels`, `original_ttl`, `inception`, `expiration`, `key_tag`, `signer_name`, `signature` (base64) |
 
-Names in record fields are absolute. DNS answer order is not guaranteed.
+Names in record fields are absolute. Answers include the CNAME chain records as
+well as the final records. DNS answer order is not guaranteed.
 Do not pin live TTLs, rotating addresses, key tags, or signature bytes unless
 they are specifically the contract being tested.
 
@@ -162,9 +168,10 @@ accepted without authenticating its answers.
 `dns.proof.SECURE`, INSECURE, BOGUS, and INDETERMINATE map to lowercase record
 proof strings. Indeterminate is also the default for unvalidated records.
 `answers_secure` requires validation to be enabled and a nonempty set of
-non-RRSIG answers whose proofs are all secure. It does not authenticate every
-section of a DNS message. Empty or RRSIG-only answers are never secure by this
-definition. Negative responses do not expose authenticated-denial proofs.
+non-RRSIG answers whose proofs are all secure, including any CNAME chain. A
+signed target behind an unsigned alias is not secure. It does not authenticate
+every section of a DNS message. Empty or RRSIG-only answers are never secure by
+this definition. Negative responses do not expose authenticated-denial proofs.
 
 Fetching DNSKEY/DS/RRSIG records or observing upstream AD is not local validation.
 Bogus data normally raises an error. An upstream SERVFAIL is not proof of a local

@@ -170,6 +170,7 @@ dependencies = [
  "futures-util",
  "hickory-resolver",
  "mlua",
+ "resolv-conf",
  "tokio",
  "usage-rs",
 ]

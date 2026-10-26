@@ -44,21 +44,77 @@ dns.proof = {
     INDETERMINATE = "indeterminate",
 }
 
+---Raise at a caller outside this file. Level 1 is the function calling argument.
+local function argument(ok, message, level)
+    if not ok then
+        error(message, (level or 2) + 1)
+    end
+end
+
+---Call a native helper and raise its message, without the native traceback, at a caller.
+local function native(level, callback, ...)
+    local result = table.pack(pcall(callback, ...))
+    if not result[1] then
+        error(tostring(result[2]):match("^[^\n]*"), level + 1)
+    end
+    return table.unpack(result, 2, result.n)
+end
+
+-- Logs are raw text chunks so io.write can emit partial lines between print calls.
 function print(...)
     local values = {}
     for index = 1, select("#", ...) do
         values[index] = tostring(select(index, ...))
     end
-    logs[#logs + 1] = table.concat(values, "\t")
+    logs[#logs + 1] = table.concat(values, "\t") .. "\n"
+end
+
+local function write(level, ...)
+    for index = 1, select("#", ...) do
+        local value = select(index, ...)
+        argument(
+            type(value) == "string" or type(value) == "number",
+            "bad argument #" .. index .. " to 'write' (string expected, got " .. type(value) .. ")",
+            level + 1
+        )
+        -- Match io.write, which formats floats with %.14g rather than tostring.
+        if math.type(value) == "float" then
+            value = string.format("%.14g", value)
+        end
+        logs[#logs + 1] = tostring(value)
+    end
+end
+
+-- Returned instead of io.stdout so chained writes are captured too.
+local captured_stdout = {}
+
+function captured_stdout:write(...)
+    write(2, ...)
+    return self
+end
+
+function captured_stdout:flush()
+    return self
+end
+
+function io.write(...)
+    write(2, ...)
+    return captured_stdout
+end
+
+-- Exiting would drop every buffered report, including other files running concurrently.
+function os.exit()
+    error("os.exit is not allowed in tests", 2)
 end
 
 local function registration(name, callback)
-    builtin_assert(registering, "tests and suites must be declared while loading the file")
-    builtin_assert(
+    argument(registering, "tests and suites must be declared while loading the file", 3)
+    argument(
         type(name) == "string" and name:match("%S"),
-        "expected a non-empty test or suite name"
+        "expected a non-empty test or suite name",
+        3
     )
-    builtin_assert(type(callback) == "function", "expected a test or suite function")
+    argument(type(callback) == "function", "expected a test or suite function", 3)
 end
 
 function describe(name, callback)
@@ -95,11 +151,25 @@ local function inspect(value, seen)
     end
     seen[value] = true
 
-    local parts = {}
-    for key, item in next, value do
-        parts[#parts + 1] = "[" .. inspect(key, seen) .. "] = " .. inspect(item, seen)
+    local keys = {}
+    for key in next, value do
+        keys[#keys + 1] = key
     end
-    table.sort(parts)
+    table.sort(keys, function(left, right)
+        local left_number, right_number = type(left) == "number", type(right) == "number"
+        if left_number and right_number then
+            return left < right
+        end
+        if left_number ~= right_number then
+            return left_number
+        end
+        return inspect(left) < inspect(right)
+    end)
+
+    local parts = {}
+    for index, key in ipairs(keys) do
+        parts[index] = "[" .. inspect(key, seen) .. "] = " .. inspect(value[key], seen)
+    end
     seen[value] = nil
 
     return "{ " .. table.concat(parts, ", ") .. " }"
@@ -185,7 +255,7 @@ function assert.contains(actual, expected, message)
 end
 
 function assert.matches(actual, pattern, message)
-    builtin_assert(
+    argument(
         type(actual) == "string" and type(pattern) == "string",
         "assert.matches expects a string and a Lua pattern"
     )
@@ -261,10 +331,10 @@ local records_mt = { __index = records }
 ---@param values DNSRecord[]
 ---@return DNSRecords
 function dns.records(values)
-    builtin_assert(type(values) == "table", "dns.records expects a list of records")
+    argument(type(values) == "table", "dns.records expects a list of records")
     local result = {}
     for _, record in ipairs(values) do
-        builtin_assert(type(record) == "table", "dns.records expects each record to be a table")
+        argument(type(record) == "table", "dns.records expects each record to be a table")
         result[#result + 1] = record
     end
     return setmetatable(result, records_mt)
@@ -283,7 +353,7 @@ end
 ---@param criteria table<string, any>
 ---@return DNSRecords
 function records:where(criteria)
-    builtin_assert(type(criteria) == "table", "where expects a table of record fields")
+    argument(type(criteria) == "table", "where expects a table of record fields")
     local result = {}
     for _, record in ipairs(self) do
         if matches_record(record, criteria) then
@@ -299,7 +369,7 @@ function records:first(criteria)
     if criteria == nil then
         return self[1]
     end
-    builtin_assert(type(criteria) == "table", "first expects a table of record fields")
+    argument(type(criteria) == "table", "first expects a table of record fields")
     for _, record in ipairs(self) do
         if matches_record(record, criteria) then
             return record
@@ -311,7 +381,7 @@ end
 ---@param criteria table<string, any>
 ---@return boolean
 function records:contains(criteria)
-    builtin_assert(type(criteria) == "table", "contains expects a table of record fields")
+    argument(type(criteria) == "table", "contains expects a table of record fields")
     return self:first(criteria) ~= nil
 end
 
@@ -319,7 +389,7 @@ end
 ---@param field? string
 ---@return any[]
 function records:values(field)
-    builtin_assert(field == nil or type(field) == "string", "values expects a field name string")
+    argument(field == nil or type(field) == "string", "values expects a field name string")
     local result = {}
     for _, record in ipairs(self) do
         local value = record[field or "data"]
@@ -365,19 +435,47 @@ end
 ---@param name string
 ---@return string
 function dns.normalize_name(name)
-    builtin_assert(
+    argument(
         type(name) == "string" and name ~= "",
         "normalize_name expects a non-empty domain name string"
     )
-    return normalize_name(name)
+    -- Not a tail call, which would remove this frame from the error level.
+    local result = native(2, normalize_name, name)
+    return result
 end
 
 ---Build the in-addr.arpa or ip6.arpa name without making a network request.
 ---@param address string
 ---@return string
 function dns.reverse_name(address)
-    builtin_assert(type(address) == "string", "reverse_name expects an IP address string")
-    return reverse_name(address)
+    argument(type(address) == "string", "reverse_name expects an IP address string")
+    local result = native(2, reverse_name, address)
+    return result
+end
+
+---Shared by the public query helpers. Level 1 is the helper calling query.
+local function query(level, name, record_type, options)
+    argument(
+        type(name) == "string" and name ~= "",
+        "expected a non-empty domain name string",
+        level + 1
+    )
+    argument(
+        record_type == nil or type(record_type) == "string",
+        "expected a record type string",
+        level + 1
+    )
+
+    argument(options == nil or type(options) == "table", "query options must be a table", level + 1)
+    options = options or {}
+    for key, value in pairs(options) do
+        argument(key == "validate", "unknown query option: " .. tostring(key), level + 1)
+        argument(type(value) == "boolean", "validate must be a boolean", level + 1)
+    end
+
+    local result = native(level + 1, native_query, name, record_type, options.validate == true)
+    result.answers = dns.records(result.answers)
+    return result
 end
 
 ---@param name string
@@ -385,24 +483,8 @@ end
 ---@param options? DNSQueryOptions
 ---@return DNSResponse
 function dns.query(name, record_type, options)
-    builtin_assert(
-        type(name) == "string" and name ~= "",
-        "dns.query expects a non-empty domain name string"
-    )
-    builtin_assert(
-        record_type == nil or type(record_type) == "string",
-        "dns.query expects a record type string"
-    )
-
-    builtin_assert(options == nil or type(options) == "table", "query options must be a table")
-    options = options or {}
-    for key, value in pairs(options) do
-        builtin_assert(key == "validate", "unknown query option: " .. tostring(key))
-        builtin_assert(type(value) == "boolean", "validate must be a boolean")
-    end
-
-    local result = native_query(name, record_type, options.validate == true)
-    result.answers = dns.records(result.answers)
+    -- Not a tail call, which would remove this frame from the error level.
+    local result = query(2, name, record_type, options)
     return result
 end
 
@@ -412,13 +494,13 @@ end
 ---@param options? DNSQueryOptions
 ---@return string[]
 function dns.resolve(name, record_type, options)
-    builtin_assert(record_type == nil or type(record_type) == "string", "resolve expects A or AAAA")
+    argument(record_type == nil or type(record_type) == "string", "resolve expects A or AAAA")
     record_type = (record_type or "A"):upper()
-    builtin_assert(
+    argument(
         record_type == "A" or record_type == "AAAA",
         "resolve expects A or AAAA. Use dns.query for other record types"
     )
-    local result = dns.query(name, record_type, options)
+    local result = query(2, name, record_type, options)
     if result.rcode ~= "NOERROR" then
         error("could not resolve " .. name .. ": " .. result.rcode, 2)
     end
@@ -430,7 +512,9 @@ end
 ---@param options? DNSQueryOptions
 ---@return DNSResponse
 function dns.reverse(address, options)
-    return dns.query(dns.reverse_name(address), "PTR", options)
+    argument(type(address) == "string", "reverse expects an IP address string")
+    local result = query(2, native(2, reverse_name, address), "PTR", options)
+    return result
 end
 
 ---Match selected fields without specifying TTLs or depending on answer order.
@@ -438,6 +522,11 @@ end
 ---@param criteria table<string, any>
 ---@param message? string
 function assert.has_answer(response, criteria, message)
+    argument(
+        type(response) == "table" and type(response.answers) == "table",
+        "assert.has_answer expects a DNS response"
+    )
+    argument(type(criteria) == "table", "assert.has_answer expects a table of record fields")
     check(
         response.answers:contains(criteria),
         message,
@@ -458,6 +547,7 @@ end
 ---@param response DNSResponse
 ---@param message? string
 function assert.secure(response, message)
+    argument(type(response) == "table", "assert.secure expects a DNS response")
     check(
         response.validation_enabled == true and response.answers_secure == true,
         message,

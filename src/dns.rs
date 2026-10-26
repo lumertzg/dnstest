@@ -2,12 +2,13 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use std::time::Instant;
 
-use hickory_resolver::Resolver;
 use hickory_resolver::config::ResolveHosts;
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::net::{DnsError, NetError};
 use hickory_resolver::proto::dnssec::{DnssecSummary, PublicKey, rdata::DNSSECRData};
 use hickory_resolver::proto::op::ResponseCode;
 use hickory_resolver::proto::rr::{Name, RData, Record, RecordType};
+use hickory_resolver::{Resolver, ResolverBuilder};
 use mlua::{Error, Lua, Table, Value};
 
 pub fn install(lua: &Lua) -> mlua::Result<()> {
@@ -59,9 +60,9 @@ async fn query(
     let mut name = Name::from_str(&host).map_err(Error::external)?;
     name.set_fqdn(true);
 
-    let mut builder = Resolver::builder_tokio().map_err(Error::external)?;
+    let mut builder = system_resolver()?;
     builder.options_mut().validate = validate;
-    builder.options_mut().preserve_intermediates = false;
+    builder.options_mut().preserve_intermediates = true;
     builder.options_mut().use_hosts_file = ResolveHosts::Never;
     let resolver = builder.build().map_err(Error::external)?;
     let started = Instant::now();
@@ -71,10 +72,7 @@ async fn query(
         Err(NetError::Dns(DnsError::ResponseCode(code))) => (code, vec![]),
         Err(error) => return Err(Error::runtime(format!("{kind} query for {host}: {error}"))),
     };
-    let code = match code {
-        ResponseCode::Unknown(value) => format!("RCODE{value}"),
-        code => format!("{code:?}").to_ascii_uppercase(),
-    };
+    let code = rcode_name(code);
     let response = lua.create_table()?;
     response.set("name", name.to_utf8())?;
     response.set("type", kind)?;
@@ -100,6 +98,34 @@ async fn query(
     )?;
 
     Ok(response)
+}
+
+fn rcode_name(code: ResponseCode) -> String {
+    let name = match code {
+        ResponseCode::NoError => "NOERROR",
+        ResponseCode::FormErr => "FORMERR",
+        ResponseCode::ServFail => "SERVFAIL",
+        ResponseCode::NXDomain => "NXDOMAIN",
+        ResponseCode::NotImp => "NOTIMP",
+        ResponseCode::Refused => "REFUSED",
+        ResponseCode::YXDomain => "YXDOMAIN",
+        ResponseCode::YXRRSet => "YXRRSET",
+        ResponseCode::NXRRSet => "NXRRSET",
+        ResponseCode::NotAuth => "NOTAUTH",
+        ResponseCode::NotZone => "NOTZONE",
+        ResponseCode::BADVERS => "BADVERS",
+        ResponseCode::BADSIG => "BADSIG",
+        ResponseCode::BADKEY => "BADKEY",
+        ResponseCode::BADTIME => "BADTIME",
+        ResponseCode::BADMODE => "BADMODE",
+        ResponseCode::BADNAME => "BADNAME",
+        ResponseCode::BADALG => "BADALG",
+        ResponseCode::BADTRUNC => "BADTRUNC",
+        ResponseCode::BADCOOKIE => "BADCOOKIE",
+        code => return format!("RCODE{}", u16::from(code)),
+    };
+
+    name.to_owned()
 }
 
 fn record_table(lua: &Lua, record: &Record) -> mlua::Result<Table> {
@@ -178,4 +204,82 @@ fn dnssec_fields(table: &Table, data: &DNSSECRData) -> mlua::Result<()> {
     }
 
     Ok(())
+}
+
+/// System nameservers and retry options, read once so every query sees the same configuration.
+#[cfg(all(unix, not(target_os = "android")))]
+struct SystemConfig {
+    servers: Vec<IpAddr>,
+    timeout: std::time::Duration,
+    attempts: usize,
+}
+
+/// Reads resolv.conf directly because hickory's macOS reader rejects scoped IPv6
+/// servers such as `fe80::1%en0`, and its unix reader drops their zone.
+#[cfg(all(unix, not(target_os = "android")))]
+fn system_resolver() -> mlua::Result<ResolverBuilder<TokioRuntimeProvider>> {
+    use std::sync::OnceLock;
+
+    use hickory_resolver::config::{NameServerConfig, ResolverConfig};
+
+    static CONFIG: OnceLock<Result<SystemConfig, String>> = OnceLock::new();
+    let config = CONFIG
+        .get_or_init(read_system_config)
+        .as_ref()
+        .map_err(Error::runtime)?;
+
+    let servers = config
+        .servers
+        .iter()
+        .map(|&ip| NameServerConfig::udp_and_tcp(ip))
+        .collect();
+    let mut builder = Resolver::builder_with_config(
+        ResolverConfig::from_parts(None, vec![], servers),
+        TokioRuntimeProvider::default(),
+    );
+    builder.options_mut().timeout = config.timeout;
+    builder.options_mut().attempts = config.attempts;
+
+    Ok(builder)
+}
+
+#[cfg(all(unix, not(target_os = "android")))]
+fn read_system_config() -> Result<SystemConfig, String> {
+    use resolv_conf::ScopedIp;
+
+    const PATH: &str = "/etc/resolv.conf";
+    let data = std::fs::read(PATH).map_err(|error| format!("reading {PATH}: {error}"))?;
+    let (config, _) = resolv_conf::Config::parse_with_errors(&data);
+
+    // Hickory cannot address a server on a specific interface, so skip zoned servers
+    // instead of failing the whole configuration.
+    let configured = config.nameservers.len();
+    let servers: Vec<_> = config
+        .nameservers
+        .into_iter()
+        .filter_map(|server| match server {
+            ScopedIp::V6(_, Some(_)) => None,
+            ip => Some(IpAddr::from(ip)),
+        })
+        .collect();
+
+    if servers.is_empty() {
+        let reason = if configured == 0 {
+            ""
+        } else {
+            ". Link-local servers with an interface zone are not supported"
+        };
+        return Err(format!("no usable nameservers found in {PATH}{reason}"));
+    }
+
+    Ok(SystemConfig {
+        servers,
+        timeout: std::time::Duration::from_secs(config.timeout.into()),
+        attempts: config.attempts as usize,
+    })
+}
+
+#[cfg(not(all(unix, not(target_os = "android"))))]
+fn system_resolver() -> mlua::Result<ResolverBuilder<TokioRuntimeProvider>> {
+    Resolver::builder_tokio().map_err(Error::external)
 }
