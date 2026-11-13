@@ -404,15 +404,26 @@ end
 ---@field name string
 ---@field type string
 ---@field rcode string
+---@field server? string The `ip:port` queried, absent when using resolv.conf.
 ---@field duration_ms number
 ---@field answers DNSRecords
 ---@field validation_enabled boolean
 ---@field answers_secure boolean
+---@field authoritative? boolean The AA flag. Only with the server option.
+---@field authorities? DNSRecords The authority section. Only with the server option.
+---@field ecs? DNSClientSubnet The ECS option the server echoed. Only with the server option.
+
+---@class DNSClientSubnet
+---@field address string
+---@field source_prefix integer
+---@field scope_prefix integer
 
 ---@class DNSQueryOptions
 ---@field validate? boolean Local DNSSEC validation, disabled by default.
+---@field server? string Query only this `ip`, `ip:port`, or `[ipv6]:port` instead of resolv.conf.
+---@field ecs? string EDNS Client Subnet such as `192.0.2.0/24`. Requires server.
 
----@type fun(name: string, record_type: string?, validate: boolean): DNSResponse
+---@type fun(name: string, record_type: string?, validate: boolean, server: string?, ecs: string?): DNSResponse
 local native_query = dns.query
 local normalize_name, reverse_name = dns.normalize_name, dns.reverse_name
 local is_ipv4, is_ipv6 = dns.is_ipv4, dns.is_ipv6
@@ -469,12 +480,40 @@ local function query(level, name, record_type, options)
     argument(options == nil or type(options) == "table", "query options must be a table", level + 1)
     options = options or {}
     for key, value in pairs(options) do
-        argument(key == "validate", "unknown query option: " .. tostring(key), level + 1)
-        argument(type(value) == "boolean", "validate must be a boolean", level + 1)
+        if key == "validate" then
+            argument(type(value) == "boolean", "validate must be a boolean", level + 1)
+        elseif key == "server" or key == "ecs" then
+            argument(
+                type(value) == "string" and value ~= "",
+                key .. " must be a non-empty string",
+                level + 1
+            )
+        else
+            argument(false, "unknown query option: " .. tostring(key), level + 1)
+        end
     end
+    -- Validation fetches DS and DNSKEY up the chain, which one server rarely holds.
+    argument(
+        not (options.validate and options.server),
+        "validate cannot be combined with server",
+        level + 1
+    )
+    -- Recursive resolvers decide on their own whether to forward a client's ECS.
+    argument(options.ecs == nil or options.server, "ecs requires server", level + 1)
 
-    local result = native(level + 1, native_query, name, record_type, options.validate == true)
+    local result = native(
+        level + 1,
+        native_query,
+        name,
+        record_type,
+        options.validate == true,
+        options.server,
+        options.ecs
+    )
     result.answers = dns.records(result.answers)
+    if result.authorities then
+        result.authorities = dns.records(result.authorities)
+    end
     return result
 end
 

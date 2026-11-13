@@ -1,15 +1,25 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use hickory_resolver::config::ResolveHosts;
+use hickory_resolver::config::{NameServerConfig, ResolveHosts, ResolverConfig};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::net::tcp::TcpClientStream;
+use hickory_resolver::net::udp::UdpClientStream;
+use hickory_resolver::net::xfer::{DnsHandle, FirstAnswer};
 use hickory_resolver::net::{DnsError, NetError};
 use hickory_resolver::proto::dnssec::{DnssecSummary, PublicKey, rdata::DNSSECRData};
-use hickory_resolver::proto::op::ResponseCode;
+use hickory_resolver::proto::op::{
+    DnsRequest, DnsRequestOptions, DnsResponse, Edns, OpCode, Query, ResponseCode,
+};
+use hickory_resolver::proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
 use hickory_resolver::proto::rr::{Name, RData, Record, RecordType};
 use hickory_resolver::{Resolver, ResolverBuilder};
+use ipnet::IpNet;
 use mlua::{Error, Lua, Table, Value};
+
+/// Per exchange. A silent server fails the query instead of being retried.
+const DIRECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn install(lua: &Lua) -> mlua::Result<()> {
     let dns = lua.create_table()?;
@@ -53,30 +63,66 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
 
 async fn query(
     lua: Lua,
-    (host, kind, validate): (String, Option<String>, bool),
+    (host, kind, validate, server, ecs): (
+        String,
+        Option<String>,
+        bool,
+        Option<String>,
+        Option<String>,
+    ),
 ) -> mlua::Result<Table> {
     let kind = kind.unwrap_or_else(|| "A".into()).to_ascii_uppercase();
     let record_type = RecordType::from_str(&kind).map_err(Error::external)?;
     let mut name = Name::from_str(&host).map_err(Error::external)?;
     name.set_fqdn(true);
+    let server = server.as_deref().map(parse_server).transpose()?;
+    let ecs = ecs.as_deref().map(parse_ecs).transpose()?;
 
-    let mut builder = system_resolver()?;
-    builder.options_mut().validate = validate;
-    builder.options_mut().preserve_intermediates = true;
-    builder.options_mut().use_hosts_file = ResolveHosts::Never;
-    let resolver = builder.build().map_err(Error::external)?;
-    let started = Instant::now();
-    let (code, answers) = match resolver.lookup(name.clone(), record_type).await {
-        Ok(lookup) => (lookup.message().response_code, lookup.answers().to_vec()),
+    let started;
+    let mut direct = None;
+    let result = match server {
+        Some(address) => {
+            started = Instant::now();
+            direct_query(address, &name, record_type, ecs)
+                .await
+                .map(|response| {
+                    let result = (response.response_code, response.answers.clone());
+                    direct = Some(response);
+                    result
+                })
+        }
+        None => {
+            let mut builder = system_resolver()?;
+            builder.options_mut().validate = validate;
+            builder.options_mut().preserve_intermediates = true;
+            builder.options_mut().use_hosts_file = ResolveHosts::Never;
+            let resolver = builder.build().map_err(Error::external)?;
+            started = Instant::now();
+            resolver
+                .lookup(name.clone(), record_type)
+                .await
+                .map(|lookup| (lookup.message().response_code, lookup.answers().to_vec()))
+        }
+    };
+    let (code, answers) = match result {
+        Ok(result) => result,
         Err(NetError::Dns(DnsError::NoRecordsFound(info))) => (info.response_code, vec![]),
         Err(NetError::Dns(DnsError::ResponseCode(code))) => (code, vec![]),
-        Err(error) => return Err(Error::runtime(format!("{kind} query for {host}: {error}"))),
+        Err(error) => {
+            let via = server
+                .map(|address| format!(" via {address}"))
+                .unwrap_or_default();
+            return Err(Error::runtime(format!(
+                "{kind} query for {host}{via}: {error}"
+            )));
+        }
     };
     let code = rcode_name(code);
     let response = lua.create_table()?;
     response.set("name", name.to_utf8())?;
     response.set("type", kind)?;
     response.set("rcode", code)?;
+    response.set("server", server.map(|address| address.to_string()))?;
     response.set("validation_enabled", validate)?;
     response.set(
         "answers_secure",
@@ -87,15 +133,10 @@ async fn query(
             ),
     )?;
     response.set("duration_ms", started.elapsed().as_secs_f64() * 1000.0)?;
-    response.set(
-        "answers",
-        lua.create_sequence_from(
-            answers
-                .iter()
-                .map(|record| record_table(&lua, record))
-                .collect::<mlua::Result<Vec<_>>>()?,
-        )?,
-    )?;
+    response.set("answers", records(&lua, &answers)?)?;
+    if let Some(message) = &direct {
+        direct_fields(&lua, &response, message)?;
+    }
 
     Ok(response)
 }
@@ -206,6 +247,136 @@ fn dnssec_fields(table: &Table, data: &DNSSECRData) -> mlua::Result<()> {
     Ok(())
 }
 
+/// Accepts `ip`, `ip:port`, or `[ipv6]:port`. Port defaults to 53.
+fn parse_server(server: &str) -> mlua::Result<SocketAddr> {
+    let address = server
+        .parse::<IpAddr>()
+        .map(|ip| SocketAddr::new(ip, 53))
+        .or_else(|_| server.parse::<SocketAddr>())
+        .ok()
+        // Scope IDs are host-specific interface numbers, which shared test files should not hold.
+        .filter(|address| {
+            let ip = address.ip();
+            address.port() != 0
+                && !ip.is_unspecified()
+                && !ip.is_multicast()
+                && !matches!(address, SocketAddr::V6(v6) if v6.scope_id() != 0)
+        });
+
+    address.ok_or_else(|| {
+        Error::external(format!(
+            "invalid server {server:?}: expected an IP address with an optional nonzero port"
+        ))
+    })
+}
+
+/// Accepts `address/prefix`. Bits past the prefix are cleared, as RFC 7871 requires.
+fn parse_ecs(value: &str) -> mlua::Result<ClientSubnet> {
+    let subnet = value.parse::<IpNet>().map_err(|_| {
+        Error::external(format!(
+            "invalid ecs {value:?}: expected an address and prefix such as 192.0.2.0/24"
+        ))
+    })?;
+
+    Ok(ClientSubnet::from(subnet.trunc()))
+}
+
+/// Sends one query over UDP, then TCP if truncated, and returns the server's reply as is.
+/// The resolver would retry error rcodes, answer RFC 6761 names locally, and chase CNAME
+/// targets at the same server, which an authoritative server refuses when out of zone.
+async fn direct_query(
+    address: SocketAddr,
+    name: &Name,
+    record_type: RecordType,
+    ecs: Option<ClientSubnet>,
+) -> Result<DnsResponse, NetError> {
+    let response = exchange(address, name, record_type, ecs, false).await?;
+    if !response.metadata.truncation {
+        return Ok(response);
+    }
+
+    let response = exchange(address, name, record_type, ecs, true)
+        .await
+        .map_err(|error| {
+            NetError::from(format!("TCP fallback after a truncated reply: {error}"))
+        })?;
+    if response.metadata.truncation {
+        return Err("truncated response over TCP".into());
+    }
+
+    Ok(response)
+}
+
+async fn exchange(
+    address: SocketAddr,
+    name: &Name,
+    record_type: RecordType,
+    ecs: Option<ClientSubnet>,
+    tcp: bool,
+) -> Result<DnsResponse, NetError> {
+    // Keep the provider alive while its TCP background task handles the response.
+    let provider = TokioRuntimeProvider::default();
+    let exchange = if tcp {
+        TcpClientStream::exchange(address, None, DIRECT_TIMEOUT, None, provider.clone()).await?
+    } else {
+        UdpClientStream::builder(address, provider)
+            .with_timeout(Some(DIRECT_TIMEOUT))
+            .with_max_retries(0)
+            .exchange()
+    };
+
+    let question = Query::query(name.clone(), record_type);
+    let mut request = DnsRequest::from_query(question.clone(), DnsRequestOptions::default());
+    if let Some(subnet) = ecs {
+        request
+            .edns
+            .get_or_insert_with(Edns::new)
+            .options_mut()
+            .insert(EdnsOption::Subnet(subnet));
+    }
+
+    let response = exchange.send(request).first_answer().await?;
+    if response.metadata.op_code != OpCode::Query {
+        return Err("response opcode does not match the query".into());
+    }
+
+    // The TCP multiplexer matches replies by ID alone.
+    if response.queries.as_slice() != std::slice::from_ref(&question) {
+        return Err("response question does not match the query".into());
+    }
+
+    Ok(response)
+}
+
+fn records(lua: &Lua, records: &[Record]) -> mlua::Result<Table> {
+    lua.create_sequence_from(
+        records
+            .iter()
+            .map(|record| record_table(lua, record))
+            .collect::<mlua::Result<Vec<_>>>()?,
+    )
+}
+
+/// Adds the header flag, authority section, and echoed ECS that only a direct query keeps.
+fn direct_fields(lua: &Lua, table: &Table, response: &DnsResponse) -> mlua::Result<()> {
+    table.set("authoritative", response.metadata.authoritative)?;
+    table.set("authorities", records(lua, &response.authorities)?)?;
+
+    let subnet = response
+        .edns
+        .as_ref()
+        .and_then(|edns| edns.option(EdnsCode::Subnet));
+    if let Some(EdnsOption::Subnet(subnet)) = subnet {
+        let ecs = lua.create_table()?;
+        ecs.set("address", subnet.addr().to_string())?;
+        ecs.set("source_prefix", subnet.source_prefix())?;
+        ecs.set("scope_prefix", subnet.scope_prefix())?;
+        table.set("ecs", ecs)?;
+    }
+
+    Ok(())
+}
+
 /// System nameservers and retry options, read once so every query sees the same configuration.
 #[cfg(all(unix, not(target_os = "android")))]
 struct SystemConfig {
@@ -219,8 +390,6 @@ struct SystemConfig {
 #[cfg(all(unix, not(target_os = "android")))]
 fn system_resolver() -> mlua::Result<ResolverBuilder<TokioRuntimeProvider>> {
     use std::sync::OnceLock;
-
-    use hickory_resolver::config::{NameServerConfig, ResolverConfig};
 
     static CONFIG: OnceLock<Result<SystemConfig, String>> = OnceLock::new();
     let config = CONFIG
