@@ -59,4 +59,32 @@ describe("example.com", function()
             print("Expected resolution failure:", tostring(err))
         end)
     end)
+
+    describe("explicit servers", function()
+        it("queries one server instead of resolv.conf", function()
+            -- A bare IP uses port 53. Authoritative servers can be targeted the same way.
+            for _, server in ipairs({ "1.1.1.1", "8.8.8.8:53" }) do
+                local response = dns.query("example.com", dns.type.A, { server = server })
+
+                assert.equal(response.rcode, dns.rcode.NOERROR)
+                assert.has_answer(response, { type = dns.type.A })
+                print(response.server, response.answers:values("address")[1])
+            end
+        end)
+
+        it("sends a client subnet to an authoritative server", function()
+            -- ns1.google.com tailors answers to the subnet and echoes the scope it used.
+            local response = dns.query("www.google.com", dns.type.A, {
+                server = "216.239.32.10",
+                ecs = "198.51.100.7/24",
+            })
+            local ecs = assert(response.ecs, "expected the server to echo ECS")
+
+            assert.equal(response.rcode, dns.rcode.NOERROR)
+            assert.truthy(response.authoritative)
+            assert.equal(ecs.address, "198.51.100.0") -- Bits past the prefix are cleared.
+            assert.equal(ecs.source_prefix, 24)
+            print("scope", ecs.scope_prefix, response.answers:values("address")[1])
+        end)
+    end)
 end)

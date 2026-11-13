@@ -10,6 +10,7 @@ or Lua packages are needed to run tests.
 - Nested suites with `describe` and `it`, plus readable assertions.
 - Structured DNS records, filtering helpers, and forward/reverse lookups.
 - Optional local DNSSEC validation and DS, DNSKEY, and RRSIG metadata.
+- Queries through resolv.conf, or straight to a chosen server with an optional EDNS Client Subnet.
 - Concurrent test files with isolated Lua environments and ordered output.
 
 ## Install

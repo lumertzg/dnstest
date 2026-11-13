@@ -169,6 +169,7 @@ dependencies = [
  "data-encoding",
  "futures-util",
  "hickory-resolver",
+ "ipnet",
  "mlua",
  "resolv-conf",
  "tokio",

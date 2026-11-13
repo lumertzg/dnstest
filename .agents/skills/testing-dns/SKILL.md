@@ -80,14 +80,48 @@ are strings. Other Hickory-supported types can also be supplied as strings.
 
 Queries use the nameservers in `/etc/resolv.conf`, ignore hosts-file entries and
 search suffixes, and use no shared resolver cache between calls. Link-local IPv6
-nameservers with an interface zone, such as `fe80::1%en0`, are skipped. There is
-no custom-nameserver option.
-The only query option is `{ validate = true }` for local DNSSEC validation,
-disabled by default. The same options table is accepted by resolve and reverse.
+nameservers with an interface zone, such as `fe80::1%en0`, are skipped.
+Query options, accepted by query, resolve, and reverse:
+
+- `validate = true` enables local DNSSEC validation, disabled by default.
+- `server = "ip"`, `"ip:port"`, or `"[ipv6]:port"` sends one request to that
+  server instead of resolv.conf, for example an authoritative server, and
+  returns exactly its answer. The port defaults to 53. An IPv6 address with a
+  port needs brackets, because `2001:db8::1:53` is itself an IPv6 address.
+  Hostnames, interface zones, unspecified, and multicast addresses are rejected.
+  - Recursion desired is still set.
+  - Truncated UDP answers are retried over TCP. A reply still truncated over
+    TCP raises an error.
+  - Error rcodes are not retried, and CNAME targets are not followed. A reply
+    holding only a CNAME or a referral therefore has no addresses, and
+    `dns.resolve` returns an empty list for it.
+  - Each exchange times out after 5 seconds, without a retry. The UDP query,
+    TCP connect, and TCP reply each have their own timeout, so a truncated reply
+    from a stalled server can take up to 15 seconds. A UDP reply with no
+    question section, which some servers send with FORMERR or REFUSED, is
+    ignored, so that query times out.
+  - Cannot be combined with `validate`.
+- `ecs = "address/prefix"` sends an EDNS Client Subnet option, for example
+  `"198.51.100.0/24"` or `"2001:db8::/56"`. Requires `server`. Bits past the
+  prefix are cleared. A prefix is required. `/0` asks the server not to use the
+  client's location, but servers may still tailor answers to the source address.
 
 Responses contain `name`, `type`, `rcode`, `duration_ms`, `answers`,
-`validation_enabled`, and `answers_secure`. NXDOMAIN returns empty answers with
-rcode NXDOMAIN. NODATA returns empty answers with rcode NOERROR. Other DNS error
+`validation_enabled`, and `answers_secure`. With the `server` option they also
+contain:
+
+- `server` as `ip:port`.
+- `authoritative`, the AA flag.
+- `authorities`, the authority section as a record collection, such as the SOA
+  of an NXDOMAIN or the NS records of a referral.
+- `ecs` with `address`, `source_prefix`, and `scope_prefix` when the server
+  echoed an ECS option. Many authoritative servers answer scope 0 for negative
+  responses.
+
+NXDOMAIN returns empty answers with
+rcode NXDOMAIN. NODATA returns empty answers with rcode NOERROR. With `server`,
+answers hold the raw answer section, so a CNAME leading to a missing name can
+appear in the answers of an NXDOMAIN. Other DNS error
 codes are also response data. Invalid input, transport failures, and local
 validation failures raise Lua errors. `dns.resolve` additionally raises on any
 non-NOERROR code. Use `pcall` to inspect expected errors without accepting every

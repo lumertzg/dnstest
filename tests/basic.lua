@@ -77,6 +77,47 @@ describe("DNS helpers", function()
         assert.contains(ipv6_err, "expected an IPv6 address")
     end)
 
+    it("rejects invalid servers before sending a query", function()
+        -- 192.0.2.0/24 is reserved for documentation, so an accepted server would time out.
+        for _, server in ipairs({
+            "ns1.example.com",
+            "192.0.2.1:0",
+            "192.0.2.1:65536",
+            "[2001:db8::1]",
+            "[fe80::1%1]:53",
+            "192.0.2.0/24",
+            "0.0.0.0",
+            "224.0.0.1",
+        }) do
+            local ok, err = pcall(dns.query, "example.com", "A", { server = server })
+
+            assert.falsy(ok, server)
+            assert.contains(tostring(err), "invalid server", server)
+        end
+
+        local ok, err = pcall(dns.query, "example.com", "A", { server = "" })
+        assert.falsy(ok)
+        assert.contains(tostring(err), "server must be a non-empty string")
+
+        ok, err = pcall(dns.query, "example.com", "A", { server = "192.0.2.1", validate = true })
+        assert.falsy(ok)
+        assert.contains(tostring(err), "validate cannot be combined with server")
+    end)
+
+    it("rejects invalid client subnets before sending a query", function()
+        for _, ecs in ipairs({ "192.0.2.1", "192.0.2.0/33", "2001:db8::/129", "subnet/24" }) do
+            local ok, err =
+                pcall(dns.query, "example.com", "A", { server = "192.0.2.1", ecs = ecs })
+
+            assert.falsy(ok, ecs)
+            assert.contains(tostring(err), "invalid ecs", ecs)
+        end
+
+        local ok, err = pcall(dns.query, "example.com", "A", { ecs = "192.0.2.0/24" })
+        assert.falsy(ok)
+        assert.contains(tostring(err), "ecs requires server")
+    end)
+
     it("filters and projects records without changing the source", function()
         local source = {
             {
